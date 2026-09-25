@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+
+# Sensitive data and local sessions
+.vk_session.json
+*.log
+logs/
+
+# Downloaded music and archives
+downloads/
+dist/downloads/
+*.mp3
+archive.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
