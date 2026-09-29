@@ -122,3 +122,51 @@ def test_demux_ts_empty_and_valid():
     packet = header + pes + bytes([0xAA] * (188 - len(header) - len(pes)))
     demuxed = demux_ts_to_audio(packet)
     assert demuxed.startswith(bytes([0xFF, 0xFB, 0x90, 0x00]))
+
+def test_archive_manager_disk_sync(tmp_path):
+    # Create an existing MP3 file in tmp_path (> 100 KB)
+    existing_file = tmp_path / "Queen - Bohemian Rhapsody.mp3"
+    existing_file.write_bytes(b"\x00" * 150000)
+
+    mgr = ArchiveManager(tmp_path)
+    track = AudioTrack(
+        id=123,
+        owner_id=456,
+        artist="Queen",
+        title="Bohemian Rhapsody",
+        duration=354,
+        url="https://example.com/audio.mp3"
+    )
+
+    # Track is not in archive.txt initially, but file exists on disk
+    assert not (tmp_path / "archive.txt").exists() or mgr.count == 0
+    # is_downloaded detects the existing file, skips it, and registers it to archive
+    assert mgr.is_downloaded(track)
+    assert mgr.is_downloaded("456_123")
+    assert (tmp_path / "archive.txt").exists()
+
+def test_pagination_user_audio(monkeypatch):
+    client = VKClient()
+    client.access_token = "fake_token"
+    client.user_id = 12345
+
+    call_offsets = []
+
+    def mock_call_api(method, params):
+        assert method == "audio.get"
+        offset = params["offset"]
+        call_offsets.append(offset)
+        if offset == 0:
+            # First page: 5000 items
+            items = [{"id": i, "owner_id": 12345, "artist": "Artist", "title": f"Track {i}", "duration": 180, "url": f"https://cdn.example.com/{i}.mp3"} for i in range(5000)]
+            return {"response": {"count": 6500, "items": items}}
+        elif offset == 5000:
+            # Second page: 1500 items
+            items = [{"id": i, "owner_id": 12345, "artist": "Artist", "title": f"Track {i}", "duration": 180, "url": f"https://cdn.example.com/{i}.mp3"} for i in range(5000, 6500)]
+            return {"response": {"count": 6500, "items": items}}
+        return {"response": {"count": 6500, "items": []}}
+
+    monkeypatch.setattr(client, "call_api", mock_call_api)
+    tracks = client.get_user_audio(owner_id=12345, count=0)
+    assert len(tracks) == 6500
+    assert call_offsets == [0, 5000]

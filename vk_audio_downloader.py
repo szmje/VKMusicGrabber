@@ -62,7 +62,7 @@ except ImportError:
 # Константы приложения и Домены
 # =====================================================================
 APP_NAME = "VK Music Grabber"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 CONFIG_FILE = ".vk_session.json"
 ARCHIVE_FILENAME = "archive.txt"
 
@@ -73,13 +73,16 @@ MIN_AUDIO_FILE_SIZE = 100 * 1024
 DEFAULT_VK_DOMAIN = "vk.ru"
 SUPPORTED_DOMAINS = ["vk.ru", "vk.com"]
 
-# Официальные параметры Kate Mobile (для легального доступа к VK Audio API)
-KATE_CLIENT_ID = "2685278"
-KATE_CLIENT_SECRET = "lxhD8OD7dMsqtXIm5IUY"
-KATE_USER_AGENT = "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; x86; unknown Android SDK built for x86; en)"
+# Официальный OAuth клиент VK.com (Desktop / Web для аудио)
+VK_COM_CLIENT_ID = "6121396"
+VK_COM_OAUTH_URL = (
+    f"https://oauth.vk.com/authorize?client_id={VK_COM_CLIENT_ID}"
+    "&scope=audio,offline&redirect_uri=https://oauth.vk.com/blank.html&response_type=token"
+)
 
 # VK API
 VK_API_VERSION = "5.131"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 # Регулярные выражения
 RE_CLEAN_FILENAME = re.compile(r'[\\/*?:"<>|]')
@@ -351,7 +354,7 @@ def create_robust_session(retries: int = 4, backoff_factor: float = 0.5) -> requ
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update({"User-Agent": KATE_USER_AGENT})
+    session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
     return session
 
 
@@ -368,16 +371,19 @@ def clean_html_entities(text: str) -> str:
 class ArchiveManager:
     """
     Управляет архивом скачанных треков (файл archive.txt в папке загрузки).
-    Позволяет пропускать повторное скачивание даже если аудиофайлы
-    были перемещены или переименованы.
+    Автоматически сканирует папку загрузки и добавляет уже сохраненные файлы
+    в архив, предотвращая повторное скачивание.
     """
     def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
         self.archive_file = output_dir / ARCHIVE_FILENAME
         self._downloaded_uids: Set[str] = set()
+        self._existing_stems: Set[str] = set()
         self._load()
+        self.sync_existing_files()
 
     def _load(self):
-        """Загружает список уже скачанных ID в память."""
+        """Загружает список уже скачанных ID из archive.txt."""
         if not self.archive_file.exists():
             return
         try:
@@ -389,14 +395,81 @@ class ArchiveManager:
         except Exception as e:
             print(f"[!] Предупреждение: Не удалось прочитать архив {self.archive_file}: {e}")
 
-    def is_downloaded(self, track_uid: str) -> bool:
-        """Проверяет, скачан ли трек ранее."""
-        return track_uid in self._downloaded_uids
+    def sync_existing_files(self) -> int:
+        """
+        Сканирует папку output_dir на наличие уже существующих MP3-файлов.
+        Если на диске найдены полноценные аудиофайлы (>= 100 КБ), они
+        автоматически регистрируются, чтобы не скачиваться повторно.
+        """
+        if not self.output_dir.exists():
+            return 0
+        added = 0
+        for mp3_path in self.output_dir.glob("*.mp3"):
+            try:
+                if mp3_path.stat().st_size >= MIN_AUDIO_FILE_SIZE:
+                    stem = mp3_path.stem.lower()
+                    self._existing_stems.add(stem)
+                    parts = mp3_path.stem.rsplit("_", 2)
+                    if len(parts) >= 3 and parts[-2].lstrip("-").isdigit() and parts[-1].isdigit():
+                        uid = f"{parts[-2]}_{parts[-1]}"
+                        if uid not in self._downloaded_uids:
+                            self.add(uid)
+                            added += 1
+            except Exception:
+                pass
+        return added
+
+    def is_downloaded(self, item: Any) -> bool:
+        """
+        Проверяет, скачан ли трек ранее (по ID в archive.txt или по наличию файла на диске).
+        item может быть строкой (track_uid) или объектом AudioTrack.
+        """
+        if isinstance(item, str):
+            track_uid = item
+            if track_uid in self._downloaded_uids:
+                return True
+            for stem in self._existing_stems:
+                if stem.endswith(f"_{track_uid.lower()}"):
+                    self.add(track_uid)
+                    return True
+            return False
+
+        track: AudioTrack = item
+        if track.uid in self._downloaded_uids:
+            return True
+
+        clean_stem = sanitize_filename(track.formatted_name).lower()
+        if clean_stem in self._existing_stems:
+            self.add(track.uid)
+            return True
+
+        clean_uid_stem = sanitize_filename(f"{track.formatted_name}_{track.uid}").lower()
+        if clean_uid_stem in self._existing_stems:
+            self.add(track.uid)
+            return True
+
+        # Проверка реальных файлов на диске
+        file1 = self.output_dir / f"{sanitize_filename(track.formatted_name)}.mp3"
+        if file1.exists() and file1.stat().st_size >= MIN_AUDIO_FILE_SIZE:
+            self._existing_stems.add(clean_stem)
+            self.add(track.uid)
+            return True
+
+        file2 = self.output_dir / f"{sanitize_filename(f'{track.formatted_name}_{track.uid}')}.mp3"
+        if file2.exists() and file2.stat().st_size >= MIN_AUDIO_FILE_SIZE:
+            self._existing_stems.add(clean_uid_stem)
+            self.add(track.uid)
+            return True
+
+        return False
 
     def add(self, track_uid: str):
-        """Добавляет трек в архив и сохраняет на диск."""
+        """Добавляет трек в архив и сохраняет на диск в archive.txt."""
+        if track_uid in self._downloaded_uids:
+            return
         self._downloaded_uids.add(track_uid)
         try:
+            self.archive_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.archive_file, "a", encoding="utf-8") as f:
                 f.write(f"{track_uid}\n")
         except Exception as e:
@@ -475,9 +548,7 @@ class VKClient:
     """
     Клиент для взаимодействия с ВКонтакте:
     1. Поддержка обоих доменов: vk.ru (основной) и vk.com (резервный).
-    2. Авторизация по логину/паролю (с 2FA и капчей через Kate Mobile OAuth).
-    3. Авторизация по Access Token.
-    4. Авторизация по Cookies (remixsid) с умным парсингом и веб-загрузкой.
+    2. Авторизация по Access Token (OAuth через vkhost / vk.com).
     """
     def __init__(self, domain: str = DEFAULT_VK_DOMAIN, min_delay: float = 2.0, max_delay: float = 4.5):
         self.domain = domain.lower() if domain.lower() in SUPPORTED_DOMAINS else DEFAULT_VK_DOMAIN
@@ -487,7 +558,6 @@ class VKClient:
         self.user_name: Optional[str] = None
         self.min_delay = min_delay
         self.max_delay = max_delay
-        self.is_cookie_session = False
 
     @property
     def fallback_domain(self) -> str:
@@ -497,10 +567,6 @@ class VKClient:
     def get_api_base(self, domain: Optional[str] = None) -> str:
         d = domain or self.domain
         return f"https://api.{d}/method/"
-
-    def get_oauth_url(self, domain: Optional[str] = None) -> str:
-        d = domain or self.domain
-        return f"https://oauth.{d}/token"
 
     def anti_ban_delay(self, action_name: str = ""):
         """Случайная пауза между обращениями к API и скачиванием файлов."""
@@ -539,92 +605,6 @@ class VKClient:
         except Exception as e:
             print(f"[!] Не удалось сохранить сессию: {e}")
 
-    def auth_by_credentials(self, login: str, password: str) -> bool:
-        """Авторизация через OAuth Kate Mobile с интерактивной поддержкой 2FA и капчи."""
-        code: Optional[str] = None
-        captcha_sid: Optional[str] = None
-        captcha_key: Optional[str] = None
-
-        print(f"\n[*] Авторизация через шлюз VK OAuth (Kate Mobile на {self.domain})...")
-
-        while True:
-            params = {
-                "grant_type": "password",
-                "client_id": KATE_CLIENT_ID,
-                "client_secret": KATE_CLIENT_SECRET,
-                "username": login,
-                "password": password,
-                "scope": "audio,offline",
-                "2fa_supported": 1,
-                "v": VK_API_VERSION
-            }
-            if code:
-                params["code"] = code
-            if captcha_sid and captcha_key:
-                params["captcha_sid"] = captcha_sid
-                params["captcha_key"] = captcha_key
-
-            resp = None
-            for dom in [self.domain, self.fallback_domain]:
-                try:
-                    resp = self.session.post(self.get_oauth_url(dom), data=params, timeout=15)
-                    if resp.status_code in (200, 400, 401):
-                        break
-                except requests.RequestException:
-                    continue
-
-            if not resp:
-                print(f"[X] Ошибка сети: не удалось связаться с OAuth шлюзом ({self.domain} / {self.fallback_domain})")
-                return False
-
-            try:
-                data = resp.json()
-            except Exception:
-                print(f"[X] Ошибка разбора ответа сервера VK (HTTP {resp.status_code})")
-                return False
-
-            if "access_token" in data:
-                self.access_token = data["access_token"]
-                self.user_id = int(data.get("user_id", 0))
-                print(f"[V] Авторизация успешна! ID пользователя: {self.user_id}")
-                self._fetch_profile_name()
-                self.save_session()
-                return True
-
-            error = data.get("error")
-            error_type = data.get("error_type")
-            error_desc = data.get("error_description", "Неизвестная ошибка")
-
-            if error == "need_validation":
-                val_type = data.get("validation_type")
-                if val_type == "2fa_app":
-                    print("[!] Требуется подтверждение 2FA: введите код из приложения-аутентификатора.")
-                else:
-                    print(f"[!] Требуется подтверждение входа ({val_type}): код выслан по SMS или в приложении VK.")
-                code = input(">> Введите код подтверждения: ").strip()
-                continue
-
-            if error == "need_captcha":
-                captcha_sid = data.get("captcha_sid")
-                captcha_img = data.get("captcha_img")
-                print(f"\n[!] Требуется ввод капчи! Откройте ссылку в браузере:\n{captcha_img}")
-                captcha_key = input(">> Введите текст с картинки капчи: ").strip()
-                continue
-
-            if error == "invalid_client":
-                print(f"[X] Ошибка: Неверный логин или пароль. ({error_desc})")
-                return False
-            elif error == "need_token":
-                print("[X] Ошибка авторизации: требуется дополнительное подтверждение аккаунта.")
-                return False
-            elif "flood" in str(error).lower() or error_type == "password_bruteforce_attempt":
-                print(f"[X] Блокировка попыток входа (Flood Control). {error_desc}")
-                print("    Совет: Воспользуйтесь авторизацией через Token или Cookies!")
-                return False
-            else:
-                print(f"[X] Ошибка авторизации: {error} - {error_desc}")
-                return False
-
     def auth_by_token(self, token_or_url: str) -> bool:
         """Авторизация по access_token (или URL из адресной строки после OAuth)."""
         token = token_or_url.strip()
@@ -644,132 +624,11 @@ class VKClient:
         if self.validate_token(token):
             self.access_token = token
             self.save_session()
-            print(f"[V] Токен успешно подтвержден! Пользователь: {self.user_name} (ID: {self.user_id})")
+            print(f"[V] Авторизация успешна! Пользователь: {self.user_name} (ID: {self.user_id})")
             return True
         else:
             print("[X] Неверный токен или срок его действия истек.")
             return False
-
-    def auth_by_cookies(self, cookies_str: str) -> bool:
-        """
-        Авторизация через cookies (remixsid из веб-версии браузера).
-        """
-        cookies_str = cookies_str.strip()
-
-        if cookies_str.isdigit():
-            print(f"\n[!] ОШИБКА ВВОДА: Значение '{cookies_str}' является просто числом (вероятно, ID пользователя или remixmid).")
-            print("    Кука 'remixsid' — это длинная строка (буквы и цифры, хэш сессии авторизации).")
-            print("    Пример правильного remixsid: 8fa7b2c019d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8")
-            print("    В браузере (F12 -> Application -> Cookies) найдите строку 'remixsid' и скопируйте ее 'Value'.\n")
-            return False
-
-        remixsid = cookies_str
-        extracted_mid = None
-
-        if "remixsid=" in cookies_str or ";" in cookies_str:
-            parts = [p.strip() for p in cookies_str.split(";")]
-            for part in parts:
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    k = k.strip()
-                    v = v.strip()
-                    if k == "remixsid":
-                        remixsid = v
-                    elif k == "remixmid" and v.isdigit():
-                        extracted_mid = int(v)
-
-        if extracted_mid:
-            self.user_id = extracted_mid
-
-        for dom in [".vk.ru", ".vk.com"]:
-            self.session.cookies.set("remixsid", remixsid, domain=dom)
-            self.session.cookies.set("remixaudio_show_alert_today", "0", domain=dom)
-            self.session.cookies.set("remixmdevice", "1920/1080/2/!!-!!!!", domain=dom)
-            if self.user_id:
-                self.session.cookies.set("remixmid", str(self.user_id), domain=dom)
-
-        is_logged_in = False
-        detected_id = None
-        detected_name = None
-
-        print("[*] Проверка сессии Cookies через серверы VK...")
-        for check_domain in ["m.vk.ru", "m.vk.com"]:
-            try:
-                resp = self.session.get(f"https://{check_domain}/feed", allow_redirects=True, timeout=12)
-                if any(x in resp.url.lower() for x in ["/login", "act=login", "/join"]):
-                    continue
-
-                html = resp.text
-                m_id = re.search(r'href="/(?:id|audios)(\d+)"', html)
-                if not m_id:
-                    m_id = re.search(r'owner_id:\s*(\d+)', html)
-                if not m_id:
-                    m_id = re.search(r'"user_id":\s*(\d+)', html)
-                if not m_id:
-                    m_id = re.search(r'AudioUtils\.followOwner\((\d+)', html)
-
-                if m_id:
-                    detected_id = int(m_id.group(1))
-
-                m_name = re.search(r'<title>(.*?)</title>', html)
-                if m_name:
-                    title_txt = m_name.group(1).strip()
-                    if "вконтакте" not in title_txt.lower() and "vk" not in title_txt.lower():
-                        detected_name = clean_html_entities(title_txt)
-
-                is_logged_in = True
-                break
-            except Exception:
-                continue
-
-        if not is_logged_in:
-            print("[X] Ошибка: Cookies недействительны (VK перенаправляет на страницу входа).")
-            print("    Убедитесь, что вы авторизованы в браузере и скопировали актуальный remixsid.")
-            return False
-
-        if detected_id:
-            self.user_id = detected_id
-        if detected_name:
-            self.user_name = detected_name
-
-        self.is_cookie_session = True
-        print("[V] Сессия по Cookies успешно инициализирована!")
-
-        token_found = self._try_get_token_from_web_session()
-        if token_found:
-            self.access_token = token_found
-            print("[V] Автоматически получен аудио-токен через активную веб-сессию!")
-            self._fetch_profile_name()
-            self.save_session()
-        else:
-            if not self.user_id:
-                print("\n[!] Не удалось автоматически определить ваш ID пользователя из профиля.")
-                uid_str = input(">> Введите ваш числовой ID ВКонтакте (например, 12345678): ").strip()
-                if uid_str.isdigit():
-                    self.user_id = int(uid_str)
-            if self.user_id:
-                print(f"[V] Активный профиль: ID {self.user_id}")
-
-        return True
-
-    def _try_get_token_from_web_session(self) -> Optional[str]:
-        """Пытается получить access_token через OAuth, используя уже установленные куки сессии."""
-        for dom in [self.domain, self.fallback_domain]:
-            try:
-                url = f"https://oauth.{dom}/authorize?client_id={KATE_CLIENT_ID}&scope=audio,offline&response_type=token&display=page"
-                resp = self.session.get(url, allow_redirects=True, timeout=12)
-                if "access_token" in resp.url:
-                    parsed = urlparse(resp.url)
-                    frag = parse_qs(parsed.fragment)
-                    extracted = frag.get("access_token")
-                    if extracted:
-                        uid = frag.get("user_id")
-                        if uid and uid[0].isdigit():
-                            self.user_id = int(uid[0])
-                        return extracted[0]
-            except Exception:
-                continue
-        return None
 
     def validate_token(self, token: str, hint_user_id: Optional[int] = None) -> bool:
         """Проверяет валидность токена вызовом account.getProfileInfo или users.get."""
@@ -860,61 +719,181 @@ class VKClient:
 
         raise RuntimeError(f"Не удалось связаться с серверами VK ({self.domain} и {self.fallback_domain}): {last_err}")
 
-    def get_user_audio(self, owner_id: Optional[int] = None, count: int = 100, offset: int = 0) -> List[AudioTrack]:
-        """Получает аудиозаписи пользователя или сообщества (через API или веб-сессию)."""
+    def get_user_audio(self, owner_id: Optional[int] = None, count: int = 0, offset: int = 0) -> List[AudioTrack]:
+        """
+        Получает аудиозаписи пользователя или сообщества.
+        count == 0 (по умолчанию) — скачивает ВСЕ доступные треки без ограничений (с постраничной пагинацией).
+        """
         target_id = owner_id if owner_id is not None else self.user_id
         if not target_id:
             raise ValueError("Не указан ID пользователя для загрузки музыки.")
 
-        if self.access_token:
+        all_tracks: List[AudioTrack] = []
+        batch_size = 5000
+        cur_offset = offset
+
+        print(f"[*] Запрос списка аудиозаписей для ID {target_id}...")
+        while True:
+            fetch_count = min(batch_size, count - len(all_tracks)) if count > 0 else batch_size
             params = {
                 "owner_id": target_id,
-                "count": min(count, 5000),
-                "offset": offset,
+                "count": fetch_count,
+                "offset": cur_offset,
                 "extended": 1
             }
             data = self.call_api("audio.get", params)
-            items = data.get("response", {}).get("items", [])
-            return [self._parse_audio_item(item) for item in items if item.get("url")]
-        else:
-            return self._get_audio_via_web(owner_id=target_id, count=count, offset=offset)
+            resp = data.get("response", {})
+            total = 0
+            items = []
+
+            if isinstance(resp, dict):
+                total = resp.get("count", 0)
+                items = resp.get("items", [])
+            elif isinstance(resp, list):
+                if resp and isinstance(resp[0], int):
+                    total = resp[0]
+                    items = resp[1:]
+                else:
+                    total = len(resp)
+                    items = resp
+            else:
+                break
+
+            if not items:
+                break
+
+            parsed_items = [self._parse_audio_item(item) for item in items if item.get("url")]
+            all_tracks.extend(parsed_items)
+
+            if total:
+                print(f"[*] Получено треков в список: {len(all_tracks)} из {total}...")
+            else:
+                print(f"[*] Получено треков в список: {len(all_tracks)}...")
+
+            cur_offset += len(items)
+
+            if count > 0 and len(all_tracks) >= count:
+                all_tracks = all_tracks[:count]
+                break
+
+            if len(items) < fetch_count:
+                break
+
+            if total and cur_offset >= total:
+                break
+
+            time.sleep(0.3)
+
+        return all_tracks
 
     def get_playlist_audio(self, owner_id: int, playlist_id: int, access_key: Optional[str] = None,
-                           count: int = 100, offset: int = 0) -> List[AudioTrack]:
-        """Получает треки из плейлиста или альбома."""
-        if self.access_token:
+                           count: int = 0, offset: int = 0) -> List[AudioTrack]:
+        """
+        Получает треки из плейлиста или альбома с постраничной пагинацией.
+        count == 0 — скачивает весь плейлист целиком без ограничений.
+        """
+        all_tracks: List[AudioTrack] = []
+        batch_size = 5000
+        cur_offset = offset
+
+        print(f"[*] Запрос списка треков плейлиста {owner_id}_{playlist_id}...")
+        while True:
+            fetch_count = min(batch_size, count - len(all_tracks)) if count > 0 else batch_size
             params = {
                 "owner_id": owner_id,
                 "album_id": playlist_id,
-                "count": count,
-                "offset": offset,
+                "count": fetch_count,
+                "offset": cur_offset,
                 "extended": 1
             }
             if access_key:
                 params["access_key"] = access_key
 
             data = self.call_api("audio.get", params)
-            items = data.get("response", {}).get("items", [])
-            return [self._parse_audio_item(item) for item in items if item.get("url")]
-        else:
-            return self._get_audio_via_web(owner_id=owner_id, playlist_id=playlist_id, access_hash=access_key, count=count, offset=offset)
+            resp = data.get("response", {})
+            total = 0
+            items = []
+
+            if isinstance(resp, dict):
+                total = resp.get("count", 0)
+                items = resp.get("items", [])
+            elif isinstance(resp, list):
+                if resp and isinstance(resp[0], int):
+                    total = resp[0]
+                    items = resp[1:]
+                else:
+                    total = len(resp)
+                    items = resp
+            else:
+                break
+
+            if not items:
+                break
+
+            parsed_items = [self._parse_audio_item(item) for item in items if item.get("url")]
+            all_tracks.extend(parsed_items)
+
+            if total:
+                print(f"[*] Получено треков плейлиста: {len(all_tracks)} из {total}...")
+            else:
+                print(f"[*] Получено треков плейлиста: {len(all_tracks)}...")
+
+            cur_offset += len(items)
+
+            if count > 0 and len(all_tracks) >= count:
+                all_tracks = all_tracks[:count]
+                break
+
+            if len(items) < fetch_count:
+                break
+
+            if total and cur_offset >= total:
+                break
+
+            time.sleep(0.3)
+
+        return all_tracks
 
     def search_audio(self, query: str, count: int = 50, offset: int = 0) -> List[AudioTrack]:
-        """Поиск аудиозаписей по ключевым словам."""
+        """Поиск аудиозаписей по ключевым словам с пагинацией."""
         if not self.access_token:
-            raise RuntimeError("Поиск аудиозаписей требует авторизации по токену или логину/паролю.")
+            raise RuntimeError("Поиск аудиозаписей требует авторизации по токену.")
 
-        params = {
-            "q": query,
-            "count": count,
-            "offset": offset,
-            "sort": 0,
-            "autocomplete": 1,
-            "extended": 1
-        }
-        data = self.call_api("audio.search", params)
-        items = data.get("response", {}).get("items", [])
-        return [self._parse_audio_item(item) for item in items if item.get("url")]
+        all_tracks: List[AudioTrack] = []
+        batch_size = min(300, count) if count > 0 else 300
+        cur_offset = offset
+
+        while True:
+            fetch_count = min(batch_size, count - len(all_tracks)) if count > 0 else batch_size
+            params = {
+                "q": query,
+                "count": fetch_count,
+                "offset": cur_offset,
+                "sort": 0,
+                "autocomplete": 1,
+                "extended": 1
+            }
+            data = self.call_api("audio.search", params)
+            resp = data.get("response", {})
+            items = resp.get("items", []) if isinstance(resp, dict) else []
+
+            if not items:
+                break
+
+            parsed_items = [self._parse_audio_item(item) for item in items if item.get("url")]
+            all_tracks.extend(parsed_items)
+            cur_offset += len(items)
+
+            if count > 0 and len(all_tracks) >= count:
+                all_tracks = all_tracks[:count]
+                break
+
+            if len(items) < fetch_count:
+                break
+
+            time.sleep(0.3)
+
+        return all_tracks
 
     def get_lyrics(self, lyrics_id: int) -> Optional[str]:
         """Получает текст песни по lyrics_id через метод audio.getLyrics."""
@@ -925,66 +904,6 @@ class VKClient:
             return data.get("response", {}).get("text")
         except Exception:
             return None
-
-    def _get_audio_via_web(self, owner_id: int, playlist_id: Optional[int] = None,
-                           access_hash: Optional[str] = None, count: int = 100, offset: int = 0) -> List[AudioTrack]:
-        """
-        Загрузка треков через мобильный веб-интерфейс (m.vk.ru / m.vk.com) при сессии по куки.
-        """
-        tracks: List[AudioTrack] = []
-        headers = {"X-Requested-With": "XMLHttpRequest"}
-
-        for dom in [self.domain, self.fallback_domain]:
-            url = f"https://m.{dom}/audio"
-            try:
-                data = {
-                    "act": "load_section",
-                    "owner_id": owner_id,
-                    "playlist_id": playlist_id if playlist_id else -1,
-                    "offset": offset,
-                    "type": "playlist",
-                    "access_hash": access_hash or "",
-                    "is_loading_all": 1
-                }
-                resp = self.session.post(url, data=data, headers=headers, timeout=15)
-                res_json = resp.json()
-                data_list = res_json.get("data", [])
-                if not data_list or not data_list[0]:
-                    continue
-
-                raw_items = data_list[0].get("list", [])
-                for item in raw_items:
-                    t_id = item[0]
-                    t_owner = item[1]
-                    t_url = item[2]
-                    t_title = clean_html_entities(item[3])
-                    t_artist = clean_html_entities(item[4])
-                    t_dur = item[5]
-                    t_cover = None
-
-                    if len(item) > 14 and item[14]:
-                        covers = item[14].split(",")
-                        t_cover = covers[-1] if covers else None
-
-                    if "audio_api_unavailable" in t_url:
-                        t_url = decode_audio_url(t_url, self.user_id or owner_id)
-
-                    tracks.append(AudioTrack(
-                        id=t_id,
-                        owner_id=t_owner,
-                        artist=t_artist,
-                        title=t_title,
-                        duration=t_dur,
-                        url=t_url,
-                        cover_url=t_cover
-                    ))
-
-                if tracks:
-                    break
-            except Exception:
-                continue
-
-        return tracks[:count]
 
     def _parse_audio_item(self, item: Dict[str, Any]) -> AudioTrack:
         """Преобразует JSON-объект VK в модель AudioTrack."""
@@ -1050,20 +969,34 @@ class AudioDownloader:
         Скачивает один трек и вшивает все метаданные.
         Возвращает True в случае успеха, False при ошибке.
         """
-        # 1. Проверяем, есть ли трек в архиве
-        if self.archive.is_downloaded(track.uid):
-            print(f"[ПРОПУСК] {track.formatted_name} (уже в archive.txt)")
+        # 1. Проверяем, есть ли трек в архиве или уже на диске
+        if self.archive.is_downloaded(track):
+            print(f"[ПРОПУСК] {track.formatted_name} (уже сохранен)")
             return True
 
         # 2. Формируем чистое имя файла
         clean_name = sanitize_filename(track.formatted_name)
         target_file = self.output_dir / f"{clean_name}.mp3"
+        alt_file = self.output_dir / f"{clean_name}_{track.uid}.mp3"
         temp_file = self.output_dir / f"{clean_name}.part"
 
+        # Если файл уже существует на диске и валиден — регистрируем и пропускаем!
+        if target_file.exists() and target_file.stat().st_size >= MIN_AUDIO_FILE_SIZE:
+            self.archive.add(track.uid)
+            self.archive._existing_stems.add(clean_name.lower())
+            print(f"[ПРОПУСК] {track.formatted_name} (файл уже существует на диске)")
+            return True
+
+        if alt_file.exists() and alt_file.stat().st_size >= MIN_AUDIO_FILE_SIZE:
+            self.archive.add(track.uid)
+            self.archive._existing_stems.add(f"{clean_name}_{track.uid}".lower())
+            print(f"[ПРОПУСК] {track.formatted_name} (файл уже существует на диске)")
+            return True
+
         if target_file.exists():
-            clean_name = sanitize_filename(f"{track.formatted_name}_{track.uid}")
-            target_file = self.output_dir / f"{clean_name}.mp3"
-            temp_file = self.output_dir / f"{clean_name}.part"
+            target_file.unlink(missing_ok=True)
+        if temp_file.exists():
+            temp_file.unlink(missing_ok=True)
 
         # 3. Скачивание аудиопотока (MP3 или HLS AES-128) с повторными попытками
         download_ok = False
@@ -1088,13 +1021,13 @@ class AudioDownloader:
 
         file_size = temp_file.stat().st_size
         if file_size < MIN_AUDIO_FILE_SIZE:
-            print(f"[X] Ошибка: Скачанный файл слишком мал ({file_size} байт, ожидалось > 1 МБ). Аудиофайл поврежден.")
+            print(f"[X] Ошибка: Скачанный файл слишком мал ({file_size} байт, ожидалось > 100 КБ). Аудиофайл поврежден.")
             temp_file.unlink(missing_ok=True)
             return False
 
         # Завершаем скачивание: переименовываем временный файл в целевой .mp3
         if target_file.exists():
-            target_file.unlink()
+            target_file.unlink(missing_ok=True)
         temp_file.rename(target_file)
 
         # 5. Получение текста песни (Lyrics)
@@ -1123,8 +1056,9 @@ class AudioDownloader:
             cover_bytes=cover_bytes
         )
 
-        # 8. Записываем трек в archive.txt (только при подтвержденном размере)
+        # 8. Записываем трек в archive.txt и в список существующих файлов
         self.archive.add(track.uid)
+        self.archive._existing_stems.add(clean_name.lower())
         size_mb = round(target_file.stat().st_size / (1024 * 1024), 2)
         print(f"[V] Сохранен: {target_file.name} [{size_mb} МБ]")
 
@@ -1364,10 +1298,7 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     auth_group = parser.add_argument_group("Параметры авторизации")
-    auth_group.add_argument("-l", "--login", type=str, help="Логин VK (телефон или e-mail)")
-    auth_group.add_argument("-p", "--password", type=str, help="Пароль VK (не рекомендуется передавать в открытом виде)")
-    auth_group.add_argument("-t", "--token", type=str, help="Access Token VK (или ссылка из Kate Mobile / vkhost)")
-    auth_group.add_argument("-c", "--cookies", type=str, help="Значение куки remixsid (или строка document.cookie)")
+    auth_group.add_argument("-t", "--token", type=str, help="Access Token VK или итоговая ссылка из vkhost.github.io (выбрать VK.com)")
 
     dest_group = parser.add_argument_group("Параметры сохранения")
     dest_group.add_argument("-o", "--output", type=str, default=None,
@@ -1375,11 +1306,11 @@ def parse_arguments() -> argparse.Namespace:
 
     target_group = parser.add_argument_group("Источник треков")
     target_group.add_argument("-u", "--user-id", type=str,
-                            help="ID пользователя, ссылка или имя (например: 12345, id12345, club12345, https://vk.ru/durov)")
+                            help="ID пользователя, ссылка или имя (например: 12345, id12345, durov, https://vk.ru/durov)")
     target_group.add_argument("--playlist", type=str,
                             help="Ссылка или идентификатор плейлиста (например: https://vk.ru/music/playlist/-123_456_key)")
     target_group.add_argument("-s", "--search", type=str, help="Поисковый запрос для поиска треков")
-    target_group.add_argument("--count", type=int, default=100, help="Количество треков для скачивания (по умолчанию: 100)")
+    target_group.add_argument("--count", type=int, default=0, help="Количество треков для скачивания (0 = все доступные без ограничений, по умолчанию: 0)")
 
     safety_group = parser.add_argument_group("Анти-бан настройки")
     safety_group.add_argument("--min-delay", type=float, default=2.0, help="Минимальная пауза между запросами в сек. (default: 2.0)")
@@ -1389,9 +1320,9 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def interactive_auth(vk_client: VKClient):
-    """Интерактивный мастер авторизации при запуске без CLI параметров."""
+    """Интерактивная авторизация через VK OAuth (vk.com)."""
     print("=" * 60)
-    print(f"       ДОБРО ПОЖАЛОВАТЬ В {APP_NAME.upper()} (v{APP_VERSION})")
+    print(f"       {APP_NAME.upper()} (v{APP_VERSION})")
     print(f"       (Поддержка доменов vk.ru и vk.com с HLS/AES-128 загрузкой)")
     print("=" * 60)
 
@@ -1402,40 +1333,21 @@ def interactive_auth(vk_client: VKClient):
                 print(f"[V] Авторизован как: {vk_client.user_name} (ID: {vk_client.user_id})\n")
                 return
 
-    while True:
-        print("\nВыберите способ входа в ВКонтакте:")
-        print("  [1] По логину и паролю (поддержка 2FA и SMS)")
-        print("  [2] По токену (Access Token от Kate Mobile — рекомендуется)")
-        print("  [3] По Cookies (remixsid из браузера vk.ru / vk.com)")
-        print("  [0] Выход")
+    print("\nАвторизация через VK OAuth (vk.com):")
+    print("  1. Откройте в браузере сайт: https://vkhost.github.io")
+    print("  2. В списке сервисов выберите 'VK.com' и нажмите 'Разрешить'.")
+    print("     (Или перейдите по прямой ссылке авторизации vk.com:")
+    print(f"      {VK_COM_OAUTH_URL} )")
+    print("  3. Скопируйте итоговую ссылку из адресной строки (или сам access_token).\n")
 
-        sub_choice = input(">> Выберите вариант (1-3): ").strip()
-        if sub_choice == "1":
-            login = input(">> Введите номер телефона или e-mail: ").strip()
-            password = getpass.getpass(">> Введите пароль (символы скрыты): ").strip()
-            if vk_client.auth_by_credentials(login, password):
-                break
-        elif sub_choice == "2":
-            print("\nПодсказка:")
-            print("  1. Откройте в браузере сайт: https://vkhost.github.io")
-            print("  2. Нажмите на 'Kate Mobile' -> нажмите 'Разрешить'.")
-            print("  3. Скопируйте всю итоговую ссылку из адресной строки (или сам токен).")
-            token = input(">> Вставьте токен или скопированную ссылку: ").strip()
-            if vk_client.auth_by_token(token):
-                break
-        elif sub_choice == "3":
-            print("\nПодсказка:")
-            print("  1. Откройте в браузере vk.ru (или vk.com) под своим аккаунтом.")
-            print("  2. Нажмите F12 -> вкладка Application (или Память/Хранилище) -> Cookies -> vk.ru.")
-            print("  3. Найдите строку 'remixsid' и скопируйте ее значение 'Value' (хэш из букв и цифр).")
-            cookies = input(">> Введите значение remixsid (или всю строку cookies): ").strip()
-            if vk_client.auth_by_cookies(cookies):
-                break
-        elif sub_choice == "0":
-            print("Выход из программы.")
-            sys.exit(0)
-        else:
-            print("[!] Неверный выбор. Попробуйте снова.")
+    while True:
+        token = input(">> Вставьте ссылку или токен: ").strip()
+        if not token:
+            print("[!] Токен не может быть пустым. Попробуйте снова.")
+            continue
+        if vk_client.auth_by_token(token):
+            break
+        print("[!] Не удалось авторизоваться. Проверьте правильность ссылки/токена и повторите ввод.")
 
 
 def interactive_destination() -> Path:
@@ -1448,7 +1360,7 @@ def interactive_destination() -> Path:
     else:
         chosen_dir = default_dir
     chosen_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[V] Файлы будут сохранены в: {chosen_dir}\n")
+    print(f"[V] Папка сохранения: {chosen_dir}\n")
     return chosen_dir
 
 
@@ -1472,8 +1384,8 @@ def interactive_source_selection(vk_client: VKClient) -> Tuple[str, Dict[str, An
                     print("[X] Неверный ID. Попробуйте снова.")
                     continue
 
-            count_str = input(">> Сколько треков получить (Enter = все доступные, макс 5000): ").strip()
-            count = int(count_str) if count_str.isdigit() else 5000
+            count_str = input(">> Сколько треков получить (Enter = все доступные без ограничений): ").strip()
+            count = int(count_str) if count_str.isdigit() and int(count_str) > 0 else 0
             return "user", {"owner_id": vk_client.user_id, "count": count}
 
         elif choice == "2":
@@ -1482,8 +1394,8 @@ def interactive_source_selection(vk_client: VKClient) -> Tuple[str, Dict[str, An
             if owner_id is None:
                 print(f"[X] Ошибка: Не удалось распознать ID или страницу '{target}'.")
                 continue
-            count_str = input(">> Сколько треков скачать (Enter = 100): ").strip()
-            count = int(count_str) if count_str.isdigit() else 100
+            count_str = input(">> Сколько треков скачать (Enter = все доступные без ограничений): ").strip()
+            count = int(count_str) if count_str.isdigit() and int(count_str) > 0 else 0
             return "user", {"owner_id": owner_id, "count": count}
 
         elif choice == "3":
@@ -1491,7 +1403,9 @@ def interactive_source_selection(vk_client: VKClient) -> Tuple[str, Dict[str, An
             parsed = parse_playlist_input(pl_url)
             if parsed:
                 owner_id, playlist_id, access_key = parsed
-                return "playlist", {"owner_id": owner_id, "playlist_id": playlist_id, "access_key": access_key}
+                count_str = input(">> Сколько треков скачать (Enter = весь плейлист целиком): ").strip()
+                count = int(count_str) if count_str.isdigit() and int(count_str) > 0 else 0
+                return "playlist", {"owner_id": owner_id, "playlist_id": playlist_id, "access_key": access_key, "count": count}
             else:
                 print("[X] Неверный формат ссылки на плейлист. Примеры:")
                 print("    https://vk.ru/music/playlist/-2000123_456_key")
@@ -1501,7 +1415,7 @@ def interactive_source_selection(vk_client: VKClient) -> Tuple[str, Dict[str, An
         elif choice == "4":
             query = input(">> Введите поисковый запрос (Артист или Название): ").strip()
             count_str = input(">> Количество треков (Enter = 50): ").strip()
-            count = int(count_str) if count_str.isdigit() else 50
+            count = int(count_str) if count_str.isdigit() and int(count_str) > 0 else 50
             return "search", {"query": query, "count": count}
 
         else:
@@ -1519,16 +1433,9 @@ def main():
 
     vk_client = VKClient(domain=args.domain, min_delay=min_delay, max_delay=max_delay)
 
-    # 1. Авторизация
+    # 1. Авторизация (только токен / OAuth)
     if args.token:
         if not vk_client.auth_by_token(args.token):
-            sys.exit(1)
-    elif args.cookies:
-        if not vk_client.auth_by_cookies(args.cookies):
-            sys.exit(1)
-    elif args.login:
-        password = args.password or getpass.getpass(">> Введите пароль VK: ")
-        if not vk_client.auth_by_credentials(args.login, password):
             sys.exit(1)
     else:
         interactive_auth(vk_client)
@@ -1539,6 +1446,13 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
         output_dir = interactive_destination()
+
+    # Инициализация загрузчика и архива с автосканированием папки
+    downloader = AudioDownloader(vk_client=vk_client, output_dir=output_dir)
+    print(f"[*] Папка сохранения: {output_dir}")
+    print(f"[*] Файл архива: {downloader.archive.archive_file} (в архиве: {downloader.archive.count} треков)")
+    if downloader.archive._existing_stems:
+        print(f"[*] Обнаружено сохраненных MP3 на диске: {len(downloader.archive._existing_stems)} (будут пропущены)")
 
     # 3. Определение источника треков
     tracks: List[AudioTrack] = []
@@ -1554,7 +1468,7 @@ def main():
             sys.exit(1)
     elif args.search:
         print(f"\n[*] Поиск аудиозаписей по запросу: '{args.search}'...")
-        tracks = vk_client.search_audio(args.search, count=args.count)
+        tracks = vk_client.search_audio(args.search, count=args.count if args.count > 0 else 50)
     elif args.user_id:
         target_id = parse_target_id(vk_client, args.user_id)
         if target_id is not None:
@@ -1573,7 +1487,7 @@ def main():
                 owner_id=source_params["owner_id"],
                 playlist_id=source_params["playlist_id"],
                 access_key=source_params.get("access_key"),
-                count=100
+                count=source_params.get("count", 0)
             )
         elif source_type == "search":
             tracks = vk_client.search_audio(query=source_params["query"], count=source_params["count"])
@@ -1582,9 +1496,7 @@ def main():
         print("[!] Не найдено доступных для скачивания треков.")
         return
 
-    print(f"\n[V] Найдено треков: {len(tracks)}")
-    downloader = AudioDownloader(vk_client=vk_client, output_dir=output_dir)
-    print(f"[*] Файл архива: {downloader.archive.archive_file} (уже в архиве: {downloader.archive.count})")
+    print(f"\n[V] Всего найдено треков: {len(tracks)}")
     print("-" * 60)
 
     # 4. Процесс скачивания с отображением статистики
@@ -1594,9 +1506,9 @@ def main():
 
     for idx, track in enumerate(tracks, 1):
         print(f"\n[{idx}/{len(tracks)}] {track.formatted_name}")
-        if downloader.archive.is_downloaded(track.uid):
+        if downloader.archive.is_downloaded(track):
             skipped_count += 1
-            print(f"      -> Уже скачан ранее (найден в {ARCHIVE_FILENAME})")
+            print(f"      -> Уже сохранен (найден в архиве или на диске, пропуск)")
             continue
 
         try:
@@ -1617,9 +1529,10 @@ def main():
     print(f"  • Использованный домен: {vk_client.domain}")
     print(f"  • Всего обработано:     {len(tracks)}")
     print(f"  • Успешно скачано:      {success_count}")
-    print(f"  • Пропущено (архив):    {skipped_count}")
+    print(f"  • Пропущено (уже были): {skipped_count}")
     print(f"  • Ошибок загрузки:      {error_count}")
     print(f"  • Папка сохранения:     {output_dir}")
+    print(f"  • Всего в архиве:       {downloader.archive.count}")
     print("=" * 60)
 
 
