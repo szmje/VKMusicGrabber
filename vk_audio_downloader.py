@@ -370,28 +370,36 @@ def clean_html_entities(text: str) -> str:
 # =====================================================================
 class ArchiveManager:
     """
-    Управляет архивом скачанных треков (файл archive.txt в папке загрузки).
+    Управляет архивом скачанных треков в формате yt-dlp ('vk <id>' в файле archive.txt).
+    Полностью совместим с опцией --download-archive из yt-dlp.
     Автоматически сканирует папку загрузки и добавляет уже сохраненные файлы
     в архив, предотвращая повторное скачивание.
     """
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, archive_path: Optional[Path] = None):
         self.output_dir = output_dir
-        self.archive_file = output_dir / ARCHIVE_FILENAME
+        self.archive_file = archive_path if archive_path else (output_dir / ARCHIVE_FILENAME)
         self._downloaded_uids: Set[str] = set()
         self._existing_stems: Set[str] = set()
         self._load()
         self.sync_existing_files()
 
     def _load(self):
-        """Загружает список уже скачанных ID из archive.txt."""
+        """Загружает список уже скачанных ID из archive.txt в формате yt-dlp ('vk <id>' или '<id>')."""
         if not self.archive_file.exists():
             return
         try:
             with open(self.archive_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line and not line.startswith("#"):
-                        self._downloaded_uids.add(line)
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) == 2:
+                        # yt-dlp формат: "vk 12345_67890" или "vkmusic 12345_67890"
+                        self._downloaded_uids.add(parts[1])
+                    else:
+                        # Простой ID: "12345_67890"
+                        self._downloaded_uids.add(parts[0])
         except Exception as e:
             print(f"[!] Предупреждение: Не удалось прочитать архив {self.archive_file}: {e}")
 
@@ -464,16 +472,16 @@ class ArchiveManager:
         return False
 
     def add(self, track_uid: str):
-        """Добавляет трек в архив и сохраняет на диск в archive.txt."""
+        """Добавляет трек в архив в формате yt-dlp ('vk <id>') и сохраняет на диск."""
         if track_uid in self._downloaded_uids:
             return
         self._downloaded_uids.add(track_uid)
         try:
             self.archive_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.archive_file, "a", encoding="utf-8") as f:
-                f.write(f"{track_uid}\n")
+                f.write(f"vk {track_uid}\n")
         except Exception as e:
-            print(f"[!] Ошибка записи в {ARCHIVE_FILENAME}: {e}")
+            print(f"[!] Ошибка записи в {self.archive_file.name}: {e}")
 
     @property
     def count(self) -> int:
@@ -957,11 +965,11 @@ class AudioDownloader:
     - Вшивание тегов, обложек и текстов
     - Рандомизированные задержки между треками (Anti-ban)
     """
-    def __init__(self, vk_client: VKClient, output_dir: Path, retry_count: int = 3):
+    def __init__(self, vk_client: VKClient, output_dir: Path, retry_count: int = 3, archive_path: Optional[Path] = None):
         self.vk_client = vk_client
         self.output_dir = output_dir
         self.retry_count = retry_count
-        self.archive = ArchiveManager(output_dir)
+        self.archive = ArchiveManager(output_dir, archive_path=archive_path)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def download_track(self, track: AudioTrack) -> bool:
@@ -1303,6 +1311,8 @@ def parse_arguments() -> argparse.Namespace:
     dest_group = parser.add_argument_group("Параметры сохранения")
     dest_group.add_argument("-o", "--output", type=str, default=None,
                             help="Путь к папке для сохранения музыки (по умолчанию: ./downloads)")
+    dest_group.add_argument("--download-archive", type=str, default=None,
+                            help="Файл архива загрузок в формате yt-dlp (по умолчанию: archive.txt в папке сохранения)")
 
     target_group = parser.add_argument_group("Источник треков")
     target_group.add_argument("-u", "--user-id", type=str,
@@ -1448,7 +1458,8 @@ def main():
         output_dir = interactive_destination()
 
     # Инициализация загрузчика и архива с автосканированием папки
-    downloader = AudioDownloader(vk_client=vk_client, output_dir=output_dir)
+    archive_path = Path(args.download_archive).expanduser().resolve() if args.download_archive else None
+    downloader = AudioDownloader(vk_client=vk_client, output_dir=output_dir, archive_path=archive_path)
     print(f"[*] Папка сохранения: {output_dir}")
     print(f"[*] Файл архива: {downloader.archive.archive_file} (в архиве: {downloader.archive.count} треков)")
     if downloader.archive._existing_stems:

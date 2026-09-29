@@ -44,11 +44,24 @@ def test_archive_manager(tmp_path):
     assert mgr.is_downloaded("100_200")
     assert mgr.count == 1
 
+    # Verify yt-dlp format on disk: "vk 100_200"
+    content = (tmp_path / "archive.txt").read_text(encoding="utf-8")
+    assert "vk 100_200" in content
+
     # Reload from disk
     mgr2 = ArchiveManager(tmp_path)
     assert mgr2.is_downloaded("100_200")
     assert not mgr2.is_downloaded("100_201")
     assert mgr2.count == 1
+
+    # Test custom archive path (like yt-dlp --download-archive)
+    custom_archive = tmp_path / "custom_ytdlp_archive.txt"
+    custom_archive.write_text("vk 999_888\nvkmusic 777_666\n555_444\n# comment\n", encoding="utf-8")
+    mgr_custom = ArchiveManager(tmp_path, archive_path=custom_archive)
+    assert mgr_custom.is_downloaded("999_888")
+    assert mgr_custom.is_downloaded("777_666")
+    assert mgr_custom.is_downloaded("555_444")
+    assert not mgr_custom.is_downloaded("111_222")
 
 def test_m3u8_conversion_regex():
     sample_m3u8 = "https://psv4.vkuseraudio.net/s/v1/audios/a1b2c3d4/index.m3u8?extra=xyz"
