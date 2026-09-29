@@ -62,7 +62,7 @@ except ImportError:
 # Константы приложения и Домены
 # =====================================================================
 APP_NAME = "VK Music Grabber"
-APP_VERSION = "2.5.0"
+APP_VERSION = "1.0.0"
 CONFIG_FILE = ".vk_session.json"
 ARCHIVE_FILENAME = "archive.txt"
 
