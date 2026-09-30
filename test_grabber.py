@@ -11,6 +11,7 @@ from vk_audio_downloader import (
     parse_playlist_input,
     parse_target_id,
     VKClient,
+    AudioDownloader,
     demux_ts_to_audio
 )
 from mutagen.id3 import ID3
@@ -159,7 +160,7 @@ def test_archive_manager_disk_sync(tmp_path):
     assert (tmp_path / "archive.txt").exists()
 
 def test_pagination_user_audio(monkeypatch):
-    client = VKClient()
+    client = VKClient(min_delay=0, max_delay=0)
     client.access_token = "fake_token"
     client.user_id = 12345
 
@@ -183,3 +184,42 @@ def test_pagination_user_audio(monkeypatch):
     tracks = client.get_user_audio(owner_id=12345, count=0)
     assert len(tracks) == 6500
     assert call_offsets == [0, 5000]
+
+def test_anti_ban_defaults_and_configuration(tmp_path):
+    client = VKClient()
+    assert client.min_delay == 3.0
+    assert client.max_delay == 6.0
+
+    downloader = AudioDownloader(vk_client=client, output_dir=tmp_path)
+    assert downloader.batch_size == 15
+    assert downloader.batch_pause == 25.0
+    assert downloader.segment_delay == 0.08
+
+def test_call_api_flood_control_retry(monkeypatch):
+    client = VKClient(min_delay=0, max_delay=0)
+    client.access_token = "fake_token"
+
+    attempts = 0
+
+    class MockResponse:
+        def __init__(self, data):
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    def mock_get(url, params=None, timeout=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Simulate error 9: Flood control
+            return MockResponse({"error": {"error_code": 9, "error_msg": "Flood control"}})
+        return MockResponse({"response": {"success": 1}})
+
+    monkeypatch.setattr(client.session, "get", mock_get)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    data = client.call_api("test.method", {})
+    assert attempts == 2
+    assert data == {"response": {"success": 1}}
+

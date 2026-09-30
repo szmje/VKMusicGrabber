@@ -558,7 +558,7 @@ class VKClient:
     1. Поддержка обоих доменов: vk.ru (основной) и vk.com (резервный).
     2. Авторизация по Access Token (OAuth через vkhost / vk.com).
     """
-    def __init__(self, domain: str = DEFAULT_VK_DOMAIN, min_delay: float = 2.0, max_delay: float = 4.5):
+    def __init__(self, domain: str = DEFAULT_VK_DOMAIN, min_delay: float = 3.0, max_delay: float = 6.0):
         self.domain = domain.lower() if domain.lower() in SUPPORTED_DOMAINS else DEFAULT_VK_DOMAIN
         self.session = create_robust_session()
         self.access_token: Optional[str] = None
@@ -576,9 +576,17 @@ class VKClient:
         d = domain or self.domain
         return f"https://api.{d}/method/"
 
-    def anti_ban_delay(self, action_name: str = ""):
+    def anti_ban_delay(self, action_name: str = "", min_d: Optional[float] = None, max_d: Optional[float] = None):
         """Случайная пауза между обращениями к API и скачиванием файлов."""
-        delay = random.uniform(self.min_delay, self.max_delay)
+        if self.min_delay == 0 and self.max_delay == 0 and min_d is None and max_d is None:
+            return
+        low = min_d if min_d is not None else self.min_delay
+        high = max_d if max_d is not None else self.max_delay
+        if low > high:
+            low, high = high, low
+        delay = random.uniform(low, high)
+        if action_name and "трек" in action_name:
+            print(f"[*] Анти-бан пауза: {delay:.1f} сек...")
         time.sleep(delay)
 
     def load_saved_session(self) -> bool:
@@ -696,7 +704,7 @@ class VKClient:
         }
         req_params.update(params)
 
-        self.anti_ban_delay(f"API {method}")
+        self.anti_ban_delay(f"API {method}", min_d=0.35, max_d=0.75)
 
         last_err = None
         for dom in [self.domain, self.fallback_domain]:
@@ -718,6 +726,19 @@ class VKClient:
                         req_params["captcha_key"] = captcha_key
                         resp = self.session.get(url, params=req_params, timeout=15)
                         return resp.json()
+                    elif err_code in (6, 9, 29):  # 6=Too many requests/sec, 9=Flood control, 29=Rate limit
+                        wait_sec = random.uniform(8.0, 15.0)
+                        print(f"\n[!] Анти-бан: VK сообщил об ограничении частоты запросов (код {err_code}: {err_msg}).")
+                        print(f"[*] Пауза безопасности {wait_sec:.1f} сек перед повтором...")
+                        time.sleep(wait_sec)
+                        resp = self.session.get(url, params=req_params, timeout=15)
+                        retry_data = resp.json()
+                        if "error" not in retry_data:
+                            return retry_data
+                        err = retry_data.get("error", {})
+                        err_code = err.get("error_code", err_code)
+                        err_msg = err.get("error_msg", err_msg)
+
                     raise RuntimeError(f"Ошибка API [{err_code}]: {err_msg}")
 
                 return data
@@ -790,7 +811,10 @@ class VKClient:
             if total and cur_offset >= total:
                 break
 
-            time.sleep(0.3)
+            page_delay = random.uniform(1.5, 3.0) if self.min_delay > 0 else 0
+            if page_delay > 0:
+                print(f"[*] Анти-бан пауза перед следующей страницей: {page_delay:.1f} сек...")
+                time.sleep(page_delay)
 
         return all_tracks
 
@@ -858,7 +882,10 @@ class VKClient:
             if total and cur_offset >= total:
                 break
 
-            time.sleep(0.3)
+            page_delay = random.uniform(1.5, 3.0) if self.min_delay > 0 else 0
+            if page_delay > 0:
+                print(f"[*] Анти-бан пауза перед следующей страницей: {page_delay:.1f} сек...")
+                time.sleep(page_delay)
 
         return all_tracks
 
@@ -899,7 +926,10 @@ class VKClient:
             if len(items) < fetch_count:
                 break
 
-            time.sleep(0.3)
+            page_delay = random.uniform(1.5, 3.0) if self.min_delay > 0 else 0
+            if page_delay > 0:
+                print(f"[*] Анти-бан пауза перед следующей страницей: {page_delay:.1f} сек...")
+                time.sleep(page_delay)
 
         return all_tracks
 
@@ -965,11 +995,23 @@ class AudioDownloader:
     - Вшивание тегов, обложек и текстов
     - Рандомизированные задержки между треками (Anti-ban)
     """
-    def __init__(self, vk_client: VKClient, output_dir: Path, retry_count: int = 3, archive_path: Optional[Path] = None):
+    def __init__(
+        self,
+        vk_client: VKClient,
+        output_dir: Path,
+        retry_count: int = 3,
+        archive_path: Optional[Path] = None,
+        batch_size: int = 15,
+        batch_pause: float = 25.0,
+        segment_delay: float = 0.08
+    ):
         self.vk_client = vk_client
         self.output_dir = output_dir
         self.retry_count = retry_count
         self.archive = ArchiveManager(output_dir, archive_path=archive_path)
+        self.batch_size = batch_size
+        self.batch_pause = batch_pause
+        self.segment_delay = segment_delay
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def download_track(self, track: AudioTrack) -> bool:
@@ -1042,6 +1084,8 @@ class AudioDownloader:
         lyrics = None
         if track.lyrics_id:
             try:
+                if self.vk_client.min_delay > 0:
+                    time.sleep(random.uniform(0.2, 0.5))
                 lyrics = self.vk_client.get_lyrics(track.lyrics_id)
             except Exception:
                 pass
@@ -1050,6 +1094,8 @@ class AudioDownloader:
         cover_bytes = None
         if track.cover_url:
             try:
+                if self.vk_client.min_delay > 0:
+                    time.sleep(random.uniform(0.1, 0.4))
                 c_resp = self.vk_client.session.get(track.cover_url, timeout=10)
                 if c_resp.status_code == 200:
                     cover_bytes = c_resp.content
@@ -1225,6 +1271,9 @@ class AudioDownloader:
             bar_format="{desc}: {percentage:3.0f}%|{bar:25}| {n_fmt}/{total_fmt} seg [{elapsed}<{remaining}]"
         ) as bar:
             for seg in segments_info:
+                if self.segment_delay > 0 and self.vk_client.min_delay > 0:
+                    time.sleep(random.uniform(self.segment_delay * 0.7, self.segment_delay * 1.3))
+
                 seg_resp = self.vk_client.session.get(seg["url"], timeout=15)
                 seg_resp.raise_for_status()
                 seg_data = seg_resp.content
@@ -1323,8 +1372,12 @@ def parse_arguments() -> argparse.Namespace:
     target_group.add_argument("--count", type=int, default=0, help="Количество треков для скачивания (0 = все доступные без ограничений, по умолчанию: 0)")
 
     safety_group = parser.add_argument_group("Анти-бан настройки")
-    safety_group.add_argument("--min-delay", type=float, default=2.0, help="Минимальная пауза между запросами в сек. (default: 2.0)")
-    safety_group.add_argument("--max-delay", type=float, default=4.5, help="Максимальная пауза между запросами в сек. (default: 4.5)")
+    safety_group.add_argument("--min-delay", type=float, default=3.0, help="Минимальная пауза между треками в сек. (default: 3.0)")
+    safety_group.add_argument("--max-delay", type=float, default=6.0, help="Максимальная пауза между треками в сек. (default: 6.0)")
+    safety_group.add_argument("--batch-size", type=int, default=15, help="Количество треков перед паузой отдыха (default: 15)")
+    safety_group.add_argument("--batch-pause", type=float, default=25.0, help="Длительность паузы отдыха в сек. (default: 25.0)")
+    safety_group.add_argument("--segment-delay", type=float, default=0.08, help="Микро-пауза между HLS-сегментами в сек. (default: 0.08)")
+    safety_group.add_argument("--safe", action="store_true", help="Ультра-безопасный режим с увеличенными интервалами (паузы 5-9 сек, отдых каждые 10 треков)")
 
     return parser.parse_args()
 
@@ -1438,8 +1491,22 @@ def interactive_source_selection(vk_client: VKClient) -> Tuple[str, Dict[str, An
 def main():
     args = parse_arguments()
 
-    min_delay = max(0.5, args.min_delay)
-    max_delay = max(min_delay, args.max_delay)
+    min_delay = args.min_delay
+    max_delay = args.max_delay
+    batch_size = args.batch_size
+    batch_pause = args.batch_pause
+    segment_delay = args.segment_delay
+
+    if args.safe:
+        min_delay = max(min_delay, 5.0)
+        max_delay = max(max_delay, 9.0)
+        batch_size = min(batch_size, 10) if batch_size > 0 else 10
+        batch_pause = max(batch_pause, 35.0)
+        segment_delay = max(segment_delay, 0.12)
+        print("[*] Активирован ультра-безопасный режим (--safe) для защиты от блокировок")
+
+    min_delay = max(0.2, min_delay)
+    max_delay = max(min_delay, max_delay)
 
     vk_client = VKClient(domain=args.domain, min_delay=min_delay, max_delay=max_delay)
 
@@ -1459,11 +1526,19 @@ def main():
 
     # Инициализация загрузчика и архива с автосканированием папки
     archive_path = Path(args.download_archive).expanduser().resolve() if args.download_archive else None
-    downloader = AudioDownloader(vk_client=vk_client, output_dir=output_dir, archive_path=archive_path)
+    downloader = AudioDownloader(
+        vk_client=vk_client,
+        output_dir=output_dir,
+        archive_path=archive_path,
+        batch_size=batch_size,
+        batch_pause=batch_pause,
+        segment_delay=segment_delay
+    )
     print(f"[*] Папка сохранения: {output_dir}")
     print(f"[*] Файл архива: {downloader.archive.archive_file} (в архиве: {downloader.archive.count} треков)")
     if downloader.archive._existing_stems:
         print(f"[*] Обнаружено сохраненных MP3 на диске: {len(downloader.archive._existing_stems)} (будут пропущены)")
+    print(f"[*] Анти-бан: интервалы {min_delay:.1f}-{max_delay:.1f} сек, перерыв {batch_pause:.1f} сек каждые {batch_size} треков")
 
     # 3. Определение источника треков
     tracks: List[AudioTrack] = []
@@ -1514,6 +1589,7 @@ def main():
     success_count = 0
     skipped_count = 0
     error_count = 0
+    downloaded_in_session = 0
 
     for idx, track in enumerate(tracks, 1):
         print(f"\n[{idx}/{len(tracks)}] {track.formatted_name}")
@@ -1525,6 +1601,22 @@ def main():
         try:
             if downloader.download_track(track):
                 success_count += 1
+                downloaded_in_session += 1
+
+                # Анти-бан пауза отдыха после группы треков
+                if (
+                    downloader.batch_size > 0
+                    and downloaded_in_session > 0
+                    and downloaded_in_session % downloader.batch_size == 0
+                    and idx < len(tracks)
+                ):
+                    pause_time = random.uniform(downloader.batch_pause * 0.85, downloader.batch_pause * 1.25)
+                    print(f"\n{'=' * 60}")
+                    print(f"[*] Анти-бан: успешно скачано {downloaded_in_session} треков.")
+                    print(f"[*] Перерыв отдыха на {pause_time:.1f} сек для безопасности аккаунта...")
+                    print(f"{'=' * 60}")
+                    time.sleep(pause_time)
+                    print("[*] Отдых окончен, продолжаем скачивание...\n")
             else:
                 error_count += 1
         except KeyboardInterrupt:
